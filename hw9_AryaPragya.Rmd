@@ -1,0 +1,268 @@
+---
+title: "Homework 9"
+author: "Pragya Arya"
+date: "4/18/2022"
+output:
+  pdf_document:
+    toc: yes
+  github_document:
+    toc: yes
+    math_method: webtex
+---
+
+```{r setup, include = F}
+if (!(require(pacman))) install.packages(pacman)
+
+options(scipen = 20)
+
+#Load libraries
+
+p_load(tidyverse, modelsummary, magrittr,
+       car, mice, yarrr,
+       sjPlot, performance,
+       lme4, lmerTest,
+       brms, bayesplot, posterior,
+       apaTables, here)
+
+numcor <- parallel::detectCores()
+
+theme_set(theme_minimal())
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, echo=F}
+
+##################################################
+# Helper functions
+################################################## 
+
+# For mean-centering
+
+mc <- function(x, center = T, scale = F) {
+  if(center == T) {x <- (x - mean(x, na.rm = T))}
+  if(scale == T) {x <-  x / sd(x, na.rm = T)}
+  return(x)
+}
+
+# For merging
+
+pre_merge <- function(x, y, show_ids = F) {
+  
+  tb <- tibble(
+    xandy = length(intersect(x, y)),
+    xnoty = length(setdiff(x, y)),
+    ynotx = length(setdiff(y, x))
+  ) %>% 
+    pivot_longer(xandy:ynotx) %>% 
+    mutate(value_com = scales::comma(value),
+           prop = scales::percent(prop.table(value), accuracy = 1)
+    )
+  
+  ids <- list(
+    xandy = intersect(x, y),
+    xnoty = setdiff(x, y),
+    ynotx = setdiff(y, x)
+  )
+  
+  return(list(summary = tb, ids = ids))
+}
+```
+
+
+```{r, include=F}
+
+# Data loading and cleaning
+
+finalres <- read_csv(here('finalres2.csv'))
+scrape <- read_csv(here('Scrape1.csv'))
+
+finalres$subject <- finalres$subject + 144 # Add constant to subject numbers in one dataset to avoid overlap
+
+# Merge datasets
+
+data <- rbind(finalres, scrape)
+
+# Remove individual datsets from environment
+
+rm(finalres)
+rm(scrape)
+
+# Subset data for analyses
+
+x <- data %>%
+  rename(likes_24hours = `24hours_likes`,
+         replies_24hours = `24hours_replies`,
+         rt_24hours = `24hours_rt`,
+         direct_rt = direct_retwee) %>% 
+  select(subject, observation_number, time_since_previous_tweet,
+         id, direct_rt, is_quote, num_of_replies, avg_day, likes_10, replies_10,
+         rt_10, likes_20, replies_20, rt_20,
+         likes_24hours, replies_24hours, rt_24hours)
+
+rm(data)
+```
+
+```{r, include = F}
+
+x %<>%
+  filter(!(duplicated(id)),
+         observation_number != 1)
+
+# Number of posts where time since previous tweet is equal to 0
+
+sum(x$time_since_previous_tweet == 0)
+sum(x$time_since_previous_tweet == 0) / nrow(x)
+
+x %<>%
+  filter(time_since_previous_tweet != 0)
+
+# Number of posts that are direct retweets
+
+sum(x$direct_rt == 1)
+sum(x$direct_rt == 1) / nrow(x)
+
+x %<>%
+  filter(direct_rt == 0)
+
+# Number of posts that are likely bots
+
+sum(x$avg_day >= 35)
+sum(x$avg_day >= 35) / nrow(x)
+
+x %<>%
+  filter(avg_day < 35)
+
+# Final database size
+
+length(unique(x$subject)) # Number of unique users
+length(unique(x$id)) # Number of unique posts
+
+##################################################
+# Create Mutated variables
+################################################## 
+
+x %<>%
+  mutate(tdiff = log(time_since_previous_tweet),
+         across(c(is_quote, direct_rt), ~ as.numeric(.))) %>% 
+  group_by(subject) %>%
+  mutate(across(c(likes_10:tdiff),
+                ~ mean(.), .names = '{col}_pm'),
+         across(c(likes_10:tdiff),
+                ~ sd(.), .names = '{col}_psd')) %>%
+  ungroup() %>% 
+  mutate(avg_day_c = mc(avg_day),
+         avg_day_cs = mc(avg_day, scale = T),
+         likes_10_pmc = likes_10 - likes_10_pm,
+         replies_10_pmc = replies_10 - replies_10_pm,
+         rt_10_pmc = rt_10 - rt_10_pm,
+         likes_20_pmc = likes_20 - likes_20_pm,
+         replies_20_pmc = replies_20 - replies_20_pm,
+         rt_20_pmc = rt_20 - rt_20_pm,
+         likes_24hours_pms = likes_24hours_pm / sd(likes_24hours_pm),
+         likes_24hours_pmc = likes_24hours - likes_24hours_pm,
+         replies_24hours_pmc = replies_24hours - replies_24hours_pm,
+         rt_24hours_pmc = rt_24hours - rt_24hours_pm,
+         tdiff_pmc = tdiff - tdiff_pm,
+         likes_24hours_pmcs = likes_24hours_pmc / likes_24hours_psd,
+         tdiff_pmcs = tdiff_pmc / tdiff_psd,
+         )
+```
+
+## Research question
+
+Does the influence of social rewards (i.e., likes on Twitter) on tweeting frenquency vary as a function of habit strength?
+
+## Variables
+
+- `tdiff_pmcs`: Tweet frequency- Time difference between a user's tweet and their immediately preceding tweet (person-mean centered and scaled)
+- `likes_24hours_pmcs`: Social reward- Number of likes a user received in the past 24 hours (person-mean centered and scaled)
+- `likes_24hours_pms`: Person-mean number of likes received in the past 24 hours (scaled)
+- `avg_day_cs`: Habit strength - Average number of a user's tweets per day (centered and scaled)
+
+## Variable Summary
+
+```{r}
+
+datasummary_skim(x %>% select(tdiff_pmcs, likes_24hours_pmcs, likes_24hours_pms, avg_day_cs))
+
+```
+
+## Model
+
+Let $Y$ = tdiff_pmcs  
+    $likes$ = likes_24hours_pmcs  
+    $avg\_likes$ = likes_24hours_pms  
+    $habit$ = avg_day_cs
+
+$y_{ij} = \beta_{0j} + \beta_{1j} likes_{ij} + e_{ij}$
+
+$\beta_{0j} = \gamma_{00} + \gamma_{01} habit_j + \gamma_{02} avg\_likes + \mu_{0j}$
+
+$\beta_{1j} = \gamma_{10} + \gamma_{11} habit_j + \mu_{1j}$
+
+### Priors
+
+$\gamma_{00} \sim N(0, 1)$
+
+$\gamma_{01} \sim N(0, 1)$
+
+$\gamma_{02} \sim N(0, 1)$
+
+$\gamma_{10} \sim N(0, 1)$
+
+$\gamma_{11} \sim N(0, 1)$
+
+$e_{ij} \sim t^+_4(0, 3)$
+
+$\mu_{0j} \sim t^+_4(0, 3)$
+
+$\mu_{1j} \sim t^+_4(0, 3)$
+
+## Results
+
+```{r}
+
+m1 <- brm(tdiff_pmcs ~ likes_24hours_pmcs * avg_day_cs + likes_24hours_pms + (1 | subject),
+          prior = c(
+            prior(normal(0, 1), class = 'Intercept'),
+            prior(normal(0, 1), class = 'b'),
+            prior(student_t(4, 0, 3), class = 'sd'),
+            prior(student_t(4, 0, 3), class = 'sigma')
+          ),
+          data = x, family = gaussian(link = "identity"),
+          cores = numcor, seed = 1,
+          file = 'Twitter Main Analysis.rds')
+
+```
+
+## Convergence Check
+
+The trace plots and rank histograms below suggest satisfactory convergence.
+
+```{r}
+
+mcmc_trace(m1, pars = c('b_likes_24hours_pmcs', 'b_avg_day_cs', 'b_likes_24hours_pms',
+                         'b_likes_24hours_pmcs:avg_day_cs'))
+
+mcmc_rank_hist(m1, pars = c('b_likes_24hours_pmcs', 'b_avg_day_cs', 'b_likes_24hours_pms',
+                         'b_likes_24hours_pmcs:avg_day_cs'))
+
+```
+
+## Posterior distribution of key parameters
+
+```{r}
+sum_m1 <- as_draws_df(m1) %>%
+  summarize_draws() %>%
+  filter(variable %in% c('b_intercept',
+                         'b_likes_24hours_pmcs', 'b_avg_day_cs', 'b_likes_24hours_pms',
+                         'b_likes_24hours_pmcs:avg_day_cs'))
+
+sum_m1 %>% 
+  knitr::kable(digits = 3)
+```
+
+## Interpretation
+
+Based on the results in the brms model above, we do not see an interaction effect between reward and habit strength in predicting tweet frequency.
